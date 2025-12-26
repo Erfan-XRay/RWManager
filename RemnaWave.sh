@@ -272,18 +272,15 @@ full_install() {
 
     optimize_system
     install_docker
-
-    echo -e "${YELLOW}Enter PANEL Domain (e.g. panel.example.com):${NC}"
+    
+    echo -e "${YELLOW}Enter your Domain (e.g. panel.example.com):${NC}"
     read -r RAW_DOMAIN
-    [ -z "$RAW_DOMAIN" ] && error "Domain cannot be empty."
+    if [ -z "$RAW_DOMAIN" ]; then error "Domain cannot be empty."; fi
 
-    echo -e "${YELLOW}Enter SUBSCRIPTION Domain (e.g. sub.example.com):${NC}"
-    read -r RAW_SUB_DOMAIN
-    [ -z "$RAW_SUB_DOMAIN" ] && error "Subscription domain cannot be empty."
-
+    # Clean domain from http/https/trailing slashes
     DOMAIN=$(echo "$RAW_DOMAIN" | sed -e 's|^https\?://||' -e 's|/$||')
-    SUB_DOMAIN=$(echo "$RAW_SUB_DOMAIN" | sed -e 's|^https\?://||' -e 's|/$||')
 
+    # SSL Email Logic
     echo -e "${YELLOW}Enter an Email for SSL renewal alerts (Leave empty to skip):${NC}"
     read -r SSL_EMAIL
     if [ -z "$SSL_EMAIL" ]; then
@@ -313,18 +310,13 @@ full_install() {
     sed -i "s|POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$DB_PASSWORD|" .env
     sed -i "s|DATABASE_URL=.*|DATABASE_URL=postgresql://postgres:$DB_PASSWORD@remnawave-db:5432/remnawave?schema=public|" .env
     sed -i "s|FRONT_END_DOMAIN=.*|FRONT_END_DOMAIN=$DOMAIN|" .env
-    sed -i "s|SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=$SUB_DOMAIN|" .env
+    sed -i "s|SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=$DOMAIN/api/sub|" .env
     sed -i "s|METRICS_PASS=.*|METRICS_PASS=$METRICS_PW|" .env
     sed -i "s|WEBHOOK_SECRET_HEADER=.*|WEBHOOK_SECRET_HEADER=$WEBHOOK_PW|" .env
 
     sed -i "/POSTGRES_PASSWORD: .*/a \      POSTGRES_DB: remnawave" docker-compose.yml
 
     info "2/4: Setting up Subscription Page..."
-
-    echo -e "${YELLOW}Create API Token in Panel → Settings → API Tokens${NC}"
-    read -p "Paste API Token: " API_TOKEN
-    [ -z "$API_TOKEN" ] && error "API Token is required"
-
     cat <<EOF > sub-compose.yml
 services:
   remnawave-sub-page:
@@ -334,12 +326,8 @@ services:
     environment:
       - APP_PORT=3010
       - REMNAWAVE_PANEL_URL=http://remnawave:3000
-      - REMNAWAVE_API_TOKEN=$API_TOKEN
-    ports:
-      - "127.0.0.1:3010:3010"
     networks:
       - remnawave-network
-
 networks:
   remnawave-network:
     external: true
@@ -347,7 +335,7 @@ EOF
 
     info "3/4: Starting Containers..."
     docker compose -f docker-compose.yml -f sub-compose.yml up -d
-
+    
     info "Waiting for database stability..."
     sleep 15
 
@@ -355,18 +343,13 @@ EOF
     docker exec remnawave-db psql -U postgres -c "CREATE DATABASE remnawave;"
 
     docker compose restart remnawave
-
+    
     info "4/4: Configuring Nginx and SSL..."
     apt-get update && apt-get install -y nginx certbot python3-certbot-nginx
-
+    
     rm -f /etc/nginx/sites-enabled/default
     systemctl stop nginx
-
-    certbot certonly --standalone \
-        -d "$DOMAIN" \
-        -d "$SUB_DOMAIN" \
-        --non-interactive --agree-tos $EMAIL_FLAG
-
+    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos $EMAIL_FLAG
     systemctl start nginx
 
     cat <<EOF > "/etc/nginx/sites-available/remnawave"
@@ -381,42 +364,26 @@ server {
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
+    client_max_body_size 100M;
+
     location / {
         proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
 EOF
-
-    cat <<EOF > "/etc/nginx/sites-available/remnawave-sub"
-server {
-    listen 80;
-    server_name $SUB_DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
-server {
-    listen 443 ssl;
-    server_name $SUB_DOMAIN;
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:3010;
-        proxy_set_header Host \$host;
-    }
-}
-EOF
-
     ln -sf /etc/nginx/sites-available/remnawave /etc/nginx/sites-enabled/
-    ln -sf /etc/nginx/sites-available/remnawave-sub /etc/nginx/sites-enabled/
-
     nginx -t && systemctl restart nginx
 
     info "Installation completed!"
     info "Panel URL: https://$DOMAIN"
-    info "Subscription URL: https://$SUB_DOMAIN"
 }
-
 
 # --- MAIN MENU ---
 while true; do
